@@ -10,35 +10,22 @@
 #include <linux/dcache.h>
 #include <linux/path.h>
 #include <linux/fs_struct.h>
+#include <linux/sched/cputime.h>
 
 #define DEVICE_NAME "task_info"
-
-/*
- * Определяем собственные команды IOCTL
- */
-#define IOCTL_GET_TASK_CPUTIME _IOWR('t', 1, struct param_task_cputime)
-#define IOCTL_GET_INODE_INFO   _IOWR('t', 2, struct param_inode_info)
-
-struct my_task_cputime {
-    __u64 utime;
-    __u64 stime;
-    __u64 sum_exec_runtime;
-};
-
-struct inode_info {
-    unsigned long inode_number;
-    unsigned long size;
-};
-
+#define IOCTL_GET_TASK_CPUTIME  _IOWR('t', 1, struct param_task_cputime)
+#define IOCTL_GET_INODE_INFO    _IOWR('t', 2, struct param_inode_info)
 
 struct param_task_cputime {
     pid_t pid;
-    struct my_task_cputime t_cputime;
+    struct task_cputime cputime;
 };
+
 
 struct param_inode_info {
     pid_t pid;
-    struct inode_info i_info;
+    unsigned long i_ino;
+    loff_t i_size;
 };
 
 static int device_open(struct inode *inode, struct file *file) {
@@ -56,65 +43,79 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     switch (cmd) {
 
-        case IOCTL_GET_TASK_CPUTIME: {
-            struct param_task_cputime param;
-            if (copy_from_user(&param,
-                               (struct param_task_cputime __user *)arg,
-                               sizeof(param))) {
-                return -EFAULT;
-            }
-            task = get_pid_task(find_get_pid(param.pid), PIDTYPE_PID);
-            if (!task) {
-                printk(KERN_ERR "IOCTL_GET_TASK_CPUTIME: Task %d not found\n",
-                       param.pid);
-                return -ESRCH;
-            }
-            param.t_cputime.utime = task->utime;
-            param.t_cputime.stime = task->stime;
-            param.t_cputime.sum_exec_runtime = task->se.sum_exec_runtime;
-
-            put_task_struct(task);
-
-            if (copy_to_user((struct param_task_cputime __user *)arg,
-                             &param,
-                             sizeof(param))) {
-                return -EFAULT;
-            }
-            break;
+    case IOCTL_GET_TASK_CPUTIME:
+    {
+        struct param_task_cputime param;
+        if (copy_from_user(&param, (void __user *)arg, sizeof(param))) {
+            return -EFAULT;
         }
 
-        case IOCTL_GET_INODE_INFO: {
-            struct param_inode_info param;
-            if (copy_from_user(&param,
-                               (struct param_inode_info __user *)arg,
-                               sizeof(param))) {
-                return -EFAULT;
+        task = get_pid_task(find_get_pid(param.pid), PIDTYPE_PID);
+        if (!task) {
+            printk(KERN_ERR "IOCTL_GET_TASK_CPUTIME: Task %d not found\n", param.pid);
+            return -ESRCH;
+        }
+
+        {
+            struct task_cputime cputime = {0};
+            task_cputime_adjusted(task, &cputime.utime, &cputime.stime);
+            cputime.sum_exec_runtime = task->se.sum_exec_runtime;
+
+            param.cputime = cputime;
+        }
+
+        put_task_struct(task);
+        if (copy_to_user((void __user *)arg, &param, sizeof(param))) {
+            return -EFAULT;
+        }
+        break;
+    }
+
+    case IOCTL_GET_INODE_INFO:
+    {
+        struct param_inode_info param;
+
+        if (copy_from_user(&param, (void __user *)arg, sizeof(param))) {
+            return -EFAULT;
+        }
+
+        task = get_pid_task(find_get_pid(param.pid), PIDTYPE_PID);
+        if (!task) {
+            printk(KERN_ERR "IOCTL_GET_INODE_INFO: Task %d not found\n", param.pid);
+            return -ESRCH;
+        }
+
+
+        {
+            struct path pwd;
+            if (!task->fs) {
+                printk(KERN_ERR "IOCTL_GET_INODE_INFO: Task %d has no fs struct\n", param.pid);
+                put_task_struct(task);
+                return -EINVAL;
             }
 
-            task = get_pid_task(find_get_pid(param.pid), PIDTYPE_PID);
-            if (!task) {
-                printk(KERN_ERR "IOCTL_GET_INODE_INFO: Task %d not found\n",
-                       param.pid);
-                return -ESRCH;
-            }
+            get_fs_pwd(task->fs, &pwd);
 
-            {
-                struct path pwd;
-                get_fs_pwd(task->fs, &pwd);
-                param.i_info.inode_number = pwd.dentry->d_inode->i_ino;
-                param.i_info.size = pwd.dentry->d_inode->i_size;
+            if (!pwd.dentry || !pwd.dentry->d_inode) {
+                printk(KERN_ERR "IOCTL_GET_INODE_INFO: Invalid dentry for Task %d\n", param.pid);
                 path_put(&pwd);
+                put_task_struct(task);
+                return -EINVAL;
             }
 
-            put_task_struct(task);
+            param.i_ino  = pwd.dentry->d_inode->i_ino;
+            param.i_size = pwd.dentry->d_inode->i_size;
 
-            if (copy_to_user((struct param_inode_info __user *)arg,
-                             &param,
-                             sizeof(param))) {
-                return -EFAULT;
-                             }
-            break;
+            path_put(&pwd);
         }
+
+        put_task_struct(task);
+
+        if (copy_to_user((void __user *)arg, &param, sizeof(param))) {
+            return -EFAULT;
+        }
+        break;
+    }
 
         default:
             return -ENOTTY;
@@ -130,18 +131,14 @@ static struct file_operations fops = {
     .release        = device_release,
 };
 
-/*
- * Инициализация и выгрузка модуля
- */
 static int __init ioctl_custom_init(void) {
-    int ret;
-    ret = register_chrdev(0, DEVICE_NAME, &fops);
-    if (ret < 0) {
+    int major = register_chrdev(0, DEVICE_NAME, &fops);
+    if (major < 0) {
         printk(KERN_ERR "Failed to register device '%s'\n", DEVICE_NAME);
-        return ret;
+        return major;
     }
     printk(KERN_INFO "Module '%s' loaded with device major number %d\n",
-           DEVICE_NAME, ret);
+           DEVICE_NAME, major);
     return 0;
 }
 
